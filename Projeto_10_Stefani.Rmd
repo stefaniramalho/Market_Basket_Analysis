@@ -1,0 +1,511 @@
+---
+title: "Sistema de Recomendação Para Rede de Varejo"
+output: html_notebook
+---
+
+Autor: Stefani Ramalho 
+
+Projeto: Data Science Academy
+
+Conjuntos de dados: [www.instacart.com](https://www.instacart.com/datasets/grocery-shopping-2017)
+
+## Market Basket Analysis
+
+Sistema de recomendacao para prever quais produtos adquiridos anteriormente estarão no próximo pedido de um usuário.
+
+### 1 - Introdução
+
+Quer você faça compras com listas de compras meticulosamente planejadas ou deixe que o capricho guie seus passos, nossos rituais únicos de compra definem quem somos. Instacart, um aplicativo de pedido e entrega de supermercado, tem como objetivo facilitar o preenchimento de sua geladeira e despensa com seus itens pessoais favoritos e itens básicos quando você precisar
+deles. Depois de selecionar produtos por meio do aplicativo Instacart, os compradores revisam seus pedidos, fazem compras e a entrega é feita na loja mais próxima a você.
+
+A equipe de ciência de dados da Instacart desempenha um papel importante no fornecimento dessa experiência de compra agradável. Atualmente, eles usam dados transacionais para desenvolver modelos que preveem quais produtos um usuário comprará novamente, quais tentará pela primeira vez ou quais adicionará ao carrinho durante uma sessão.
+
+### 2 - Carregando os módulos e visualizando os dados
+
+```{r}
+# Importando os modulos
+library(data.table)
+library(tidyverse)
+#install.packages('fastDummies')
+library(fastDummies)
+library(plotrix)
+library(scales)
+library(gridExtra)
+#install.packages('arules')
+library(arules)
+
+# Lendo os conjuntos de dados
+order_train <- fread('dados/order_products__train.csv')
+order_prior <- fread('dados/order_products__prior.csv')
+products <- fread('dados/products.csv')
+departments <- fread('dados/departments.csv')
+aisles <- fread('dados/aisles.csv')
+orders <- fread('dados/orders.csv')
+```
+### orders
+* order_id: identificador da ordem
+* user_id: identificador do cliente
+* eval_set: conjunto de dados a qual este item percente ("prior" "train" "test")
+* order_number: numero da ordem a qual pertence
+* order_dow: dia da semana em que foi feita a compra
+* order_hour_of_day: a hora do dia em que foi feita a compra
+* days_since_prior: dias desde a ultima compra, com limite ate 30 (na = 1)
+
+```{r}
+head(orders)
+```
+### products
+* product_id: identificador do produto
+* product_name: nome do produto
+* aisle_id: identificador do corredor
+* department_id: identificador do departamento
+```{r}
+head(products)
+```
+### aisles
+* aisle_id: identificador
+* aisle: nome do corredor
+```{r}
+head(aisles)
+```
+### deptartments
+* department_id: identifcador do departamento
+* department: nome do departamento
+```{r}
+head(departments)
+```
+### order_prior (ordens anteriores)
+* order_id: identificador da ordem
+* product_id: identificador do produto
+* add_to_cart_order: order em que o produto foi adicionado ao carrinho
+* reordered: se o produto foi comprado pelo cliente no passado (1: sim - 0: nao)
+```{r}
+head(order_prior)
+```
+### order_train (dados de treinamento)
+* order_id: identificador da ordem
+* product_id: identificador do produto
+* add_to_cart_order: order em que o produto foi adicionado ao carrinho
+* reordered: se o produto foi comprado pelo cliente no passado (1: sim - 0: nao)
+```{r}
+head(order_train)
+```
+
+### 3 - Limpeza e tratamento dos dados
+
+Apenas o dataset "Ordes" possui valores ausentes presentates no atributo "days_since_prior_order". Após verificação no dataset, os valores NA estão presentes no atributo "eval_set" com a categoria "prior", desta forma o valor da média irá preencher os valroes vazios. 
+
+```{r}
+# Funcao para buscar balores NA
+valores_na <- function(df){
+  
+  dados = sapply(df, function(x){
+    sum(is.na(x))
+  }) %>%
+    data.frame() %>%
+    rownames_to_column() %>%
+    filter(. > 0)
+  
+  names(dados) = c("variavel","NA")
+  return(dados)
+}
+
+# Buscando por valores missings em todos os datasets
+for (dfs in c('aisles', 'departments', 'order_prior', 'order_train', 'orders', 'products')){
+  if (any(is.na(get(dfs)))) {
+    get(dfs) %>% valores_na() %>% print()
+  }
+}
+
+# removendo valores NA referente ao atributo days_since_prior_order e subistituindo pela media com o eval_sel prior
+orders[is.na(orders$days_since_prior_order), 'days_since_prior_order'] = 10
+```
+
+Agrupando os datasets products, departments e aisles aos dataset order_train e order_prior, criando um unico conjunto de dados.
+
+```{r}
+# Agrupando os datasets train e prior
+dataset <- order_train %>% 
+  mutate('eval_set' = 'train') %>%
+  bind_rows(
+    order_prior %>% 
+    mutate('eval_set' = 'prior')) %>%
+  inner_join(products, by = 'product_id') %>%
+  inner_join(departments, by = 'department_id') %>%
+  inner_join(aisles, by = 'aisle_id')
+
+# removendo os datasets que foram usados no agrupamento
+rm(products, departments, aisles, order_train, order_prior)
+
+# Visualisando o dataset final
+str(dataset)
+```
+
+### 4 - Analise exploratoria
+
+Total de itens vendidos de acordo com o eval_sel, sendo a maior parte dos dados do tipo prior.
+
+```{r}
+# agrupando os dados por eval_set e criando um atributo para contar o total de itens
+dataset %>% group_by(eval_set) %>%
+  summarise(total = n()) %>%
+  ggplot(aes(x = eval_set, y = total, fill = eval_set)) +
+  geom_bar(stat = 'identity') +
+  theme_classic() +
+  ggtitle("Total de vendas por eval_set")
+```
+
+Total de itens vendidos de acordo com o atributo reordered, sendo que a maioria do valores pertencem ao valor 1, ou seja, são produtos que já foram comprados anteriormente.
+
+```{r}
+# Agrupando os dados por reordered e dividindo os plots por eval_set
+dataset %>% group_by(reordered, eval_set) %>%
+  summarise(total = n()) %>%
+  ggplot(aes(x = reordered, y = total, fill = factor(reordered))) +
+  facet_wrap(. ~ eval_set) +
+  geom_bar(stat = 'identity') +
+  theme_classic() +
+  ggtitle("Total de vendas por reordered") +
+  labs(fill = "reordered")
+```
+
+Itens mais vendidos de acordo com o Departamento e se eram itens que o cliente já tinha comprado anteriormente ou não.
+
+```{r}
+# itens mais vendidos por departamento e recompra
+dataset %>% group_by(department, reordered) %>%
+  summarise(total = n()) %>%
+  ggplot(aes(x = reorder(department, total), y = total, fill = total)) +
+  geom_bar(stat = 'identity', show.legend = FALSE) +
+  scale_fill_gradient(low='sky blue', high='blue') +
+  coord_flip() +
+  facet_grid(. ~ reordered) +
+  theme_get() +
+  xlab("total de vendas") + ylab('departamento') +
+  ggtitle("Total de vendas por Departamento / reordered")
+```
+
+Total de vendas relativa por departamento.
+
+```{r}
+# Agrupando os itens vendidos por departamento e criando um atributo para encontrar a venda relativa
+dataset %>%
+  group_by(department) %>%
+  summarise(total = n()) %>%
+  mutate(part = total / nrow(dataset)) %>%
+  ggplot(mapping = aes(x = reorder(department, part), y = part)) +
+  geom_bar(stat = 'identity', fill = 'sky blue', color = 'white') +
+  geom_text(aes(label=scales::percent(part)), hjust=1.2, size = 2.5, color = 'black') +
+  coord_flip() +
+  theme_classic() +
+  ylab("Departamento") + xlab("Percentual de itens vendidos") +
+  ggtitle('% de vendas por departamentos')
+```
+
+10 Itens mais vendidos
+
+```{r}
+# Plot com a venda relativa dos 10 itens com maior volume de vendas
+dataset %>%
+  group_by(product_name) %>%
+  summarise(total = n()) %>%
+  arrange(desc(total)) %>%
+  top_n(10, total) %>%
+  mutate(part = total / sum(total)) %>%
+  ggplot(mapping = aes(x = reorder(product_name, part), y = part, fill = part)) +
+  geom_bar(stat = 'identity',  show.legend = FALSE) +
+  scale_fill_gradient(low='white', high='red', limits=c(0,.25)) +
+  coord_polar() +
+  theme_light() +
+  theme(axis.text.x = element_text(angle=-10)) +
+  ylab("Produto") + xlab("venda relativa") +
+  ggtitle('% dos 10 produtos mais vendidos')
+```
+
+Top 10 de vendas de acordo com o corredor. Sendo os mais vendidos são as sessões de frutas e vegetais.
+
+```{r}
+# plotando os 10 itens mais vendidos de acordo com o atributo aisle
+dataset %>% group_by(aisle) %>%
+  summarise(compras = n()) %>%
+  arrange(desc(compras)) %>%
+  top_n(10, compras) %>%
+  ggplot(aes(x = aisle, y = compras, fill = compras)) +
+  geom_bar(stat = 'identity', show.legend = FALSE) +
+  theme_classic() +
+  coord_flip() +
+  scale_fill_gradient(low='sky blue', high='blue') +
+  ylab("aisle") + xlab("Total de vendas") +
+  ggtitle('10 aisle com maior volume de vendas')
+```
+
+Venda relativa dos Top 10 em produtos, sendo os mais vendidos são frutas e vegetais.
+
+```{r}
+# agrupando os dados por produtos e criando um cluster com o total dos demais itens
+dataset %>% group_by(product_name) %>%
+  summarise(vendas = n()) %>%
+  arrange(desc(vendas)) %>%
+  top_n(10, vendas) %>%
+  bind_rows(
+      dataset %>% group_by(product_name) %>% 
+        summarise(vendas = n()) %>%
+        top_n(10, vendas) %>%
+        summarise(vendas = sum(vendas)) %>%
+        mutate(vendas = nrow(dataset) - vendas, product_name = 'outros') %>%
+        select(product_name, everything())
+  ) %>%
+  mutate(part = vendas / sum(vendas)) %>%
+  ggplot(aes(x = reorder(product_name, -part), y = part, fill = part)) +
+  geom_bar(stat = 'identity', show.legend = FALSE) +
+  geom_text(aes(label=scales::percent(part)), hjust=-0.1, size = 3, color = 'black') +
+  coord_flip() +
+  theme_classic() +
+  scale_fill_gradient(low='blue', high=' sky blue') +
+  ylab("% de vendas") + xlab("product_name") +
+  ggtitle('% Total de vendas por produto - top 10')
+```
+
+Explorando os dados do dataset orders
+
+```{r}
+# histograma com o total de dias desde a ultima compra
+p1 <- ggplot(orders, aes(x = days_since_prior_order)) +
+    geom_histogram(bins = 20, fill = 'sky blue') + 
+    theme_classic() +
+    theme(plot.title = element_text(size = 10),
+          axis.title.y = element_text(size = 6)) +
+    ylab("Frequencia") + xlab("Dias desde a ultima compra") +
+    ggtitle('Total de dias desde a ultima compra')
+
+# histograma com as horas da compra
+p2 <- ggplot(orders, aes(x = order_hour_of_day)) +
+    geom_histogram(bins = 20, fill = 'sky blue') + 
+    theme_classic() +
+    theme(plot.title = element_text(size = 10),
+          axis.title.y = element_text(size = 6)) +
+    ylab("Frequencia") + xlab("Hora da compra") +
+    ggtitle('Hora em que foi realizada a compra')
+
+# bar plot com as vendas por dia da semana
+p3 <- ggplot(orders, aes(x = factor(order_dow))) +
+    geom_bar(fill = 'sky blue') + 
+    theme_classic() +
+    theme(plot.title = element_text(size = 10),
+          axis.title.y = element_text(size = 6)) +
+    ylab("Frequencia") + xlab("Dia da compra") +
+    ggtitle('Vendaa por dia da semana')
+
+# histograma com o total de itens no carringo de compras
+p4 <- ggplot(orders, aes(x = order_number)) +
+    geom_histogram(bins = 20, fill = 'sky blue') + 
+    theme_classic() +
+    theme(plot.title = element_text(size = 10),
+          axis.title.y = element_text(size = 6)) +
+    ylab("Frequencia") + xlab("Ordem da compra") +
+    ggtitle('Quantidade de itens no carrinho')
+
+# plotando os resultados no mesmo grid
+grid.arrange(p1, p2, p3, p4, ncol=2)
+```
+
+Vizivelmente as vendas se concentram no início da semana, sendo na segunda feira na parte da tarde e na terca no periodo da manhã.
+
+```{r}
+# Gráfico de calor por total de vendas, hora e dia da compra.
+orders %>% group_by(order_dow, order_hour_of_day) %>%
+  summarise(compras = n()) %>%
+  ggplot(aes(x = as.factor(order_dow), y = as.factor(order_hour_of_day))) +
+  geom_raster(aes(fill = compras),interpolate = FALSE) +
+  scale_fill_gradientn(colours=c("white","yellow2","red")) +
+  theme_classic() +
+  ylab("Hora") + xlab("Dia da semana") +
+  ggtitle('Mapa de calor por total de compras')
+```
+
+### 5 - Criando cluster por tipo de cliente
+
+Criando novos atributos de acordo com o dia da compra, horario, tempo desde a ultima compra, para clusterizar os tipos de clientes.
+```{r}
+# Agrupando os dados por cliente e criando novos atributos para clusterizar os dados
+orders_cl <- orders %>% select(-c(order_id, eval_set, order_number)) %>%
+  mutate(order_hour_of_day = if_else(order_hour_of_day < 12, 'manha', 'noite')) %>%
+  mutate_at(vars(order_dow,order_hour_of_day), list(as.factor)) %>%
+  dummy_cols() %>%
+  group_by(user_id) %>%
+  summarise('vendas' = n(),
+            'd0' = sum(order_dow_0),
+            'd1' = sum(order_dow_1),
+            'd2' = sum(order_dow_2),
+            'd3' = sum(order_dow_3),
+            'd4' = sum(order_dow_4),
+            'd5' = sum(order_dow_5),
+            'd6' = sum(order_dow_6),
+            'h_m' = sum(order_hour_of_day_manha),
+            'h_n' = sum(order_hour_of_day_noite),
+            'days_since_median' = mean(days_since_prior_order)) %>%
+  mutate_at(vars(-user_id), list(scale))
+
+# visualizando os dados para agrupamento
+head(orders_cl)
+```
+Criando os clusters que variam de 10 a 50 e plotando a soma dentro dos quadrados, onde o numero de clusters escolhidos foi de 20.
+
+```{r}
+# criando um loop para coletar a soma dos quadrados de 10 a 50 clusters
+totw <- NULL
+ncluster <- 10:50
+
+for (i in ncluster) {
+  set.seed(124)
+  totw <- append(totw, kmeans(orders_cl[,-1], centers = i,  iter.max = 100)$tot.withinss)
+}
+
+# criando um dataframe para plotar os resultados
+resultados <- data.frame("cluster" = ncluster, "withinss" = totw)
+
+# plotando os resultados
+resultados %>%
+  mutate(Maior = ifelse(withinss == max(withinss), withinss, NA),
+         Menor = ifelse(withinss == min(withinss), withinss, NA)) %>%
+ggplot(aes(x = cluster, y = withinss)) +
+  geom_line(color = 'blue') + 
+  geom_point(color = 'blue3') +
+  geom_point(aes(y = Menor), color = 'green3', size = 3) +
+  geom_point(aes(y = Maior), color = 'red', size = 3) +
+  theme_classic() +
+  ylab("soma dentro dos quadrados") + xlab("numero de clusters") +
+  ggtitle("Analise do algoritimo kmeans \nNumero de clusters x Soma dentro dos quadrados")
+```
+
+### 6 - Analise exploratória dos clusters
+
+Criando 20 clusters para o dataset ordes e plotando os grupos em um gráfico de dispersão, onde foi necessário separar em dois gráficos para facilitar a visualização.
+
+```{r}
+# criando as 20 classes com o algoritimo kmeans
+set.seed(124)
+orders_cl$classes <- kmeans(orders_cl[,-1], centers = 20,  iter.max = 100)$cluster
+
+# classes de 1 a 9
+p1 <- orders_cl %>% filter(classes <= 10) %>%
+ggplot(aes(x = days_since_median, y = vendas, colour = factor(classes))) +
+  geom_point(size = 1, position = 'jitter') +
+  theme_classic() +
+  theme(plot.title = element_text(size = 10),
+        legend.text = element_text(size = 8)) +
+  ggtitle("classes de 0 a 10") +
+  labs(colour = "Classes")
+
+# classes de 10 a 20
+p2 <- orders_cl %>% filter(classes > 10) %>%
+ggplot(aes(x = days_since_median, y = vendas, colour = factor(classes))) +
+  geom_point(size = 1, position = 'jitter') +
+  theme_classic() +
+  theme(plot.title = element_text(size = 10),
+        legend.text = element_text(size = 8)) +
+  ggtitle("classes de 11 a 20") +
+  labs(colour = "Classes")
+
+# Plotando as classes
+grid.arrange(p1, p2, ncol = 2)
+```
+
+As classes 20, 6 e 4 possuem a maior quantidade de clientes
+
+```{r}
+# agrupando os dados por total de clientes em cada classe
+orders_cl %>% group_by(classes) %>%
+  summarise('clientes' = n_distinct(user_id)) %>%
+  ggplot(aes(x = reorder(classes, clientes), y = clientes, fill = clientes)) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  theme_classic() +
+  scale_fill_gradient(low='sky blue', high='blue') +
+  labs(fill = "n clientes") +
+  ylab("Classes") + xlab("Numero de clientes") +
+  ggtitle('Total de clientes por classe')
+```
+
+Quanto ao total de itens vendidos, as classes 6, 20 e 14 possuem a maior quantidade de itens vendidos
+
+```{r}
+# incluindo as classes aos dados de vendas
+dataset <- orders %>% select(user_id, order_id) %>%
+      inner_join(orders_cl, by = 'user_id') %>%
+      select(order_id, classes) %>% right_join(dataset, by = 'order_id') %>%
+      select(everything(), classes)
+
+# plotanto o total de produtos por vendidos por classes
+dataset %>% group_by(classes) %>%
+  summarise('produtos' = n_distinct(product_id)) %>%
+  ggplot(aes(x = reorder(classes, produtos), y = produtos, fill = produtos)) +
+  geom_bar(stat = 'identity') +
+  coord_flip() +
+  theme_classic() +
+  scale_fill_gradient(low='sky blue', high='blue') +
+  labs(fill = "n produtos") +
+  ylab("Classes") + xlab("Numero de produtos comprados") +
+  ggtitle('Total de produtos por classe')
+```
+
+Media de produtos vendidos por classes, sendo as classes 12 e 14 possuem a maior media de itens vendidos, no entando não existem grandes diferenças entre as classes.
+
+```{r}
+# Agrupando os dados por classes e calculando a media de vendas
+dataset %>% group_by(order_id, classes) %>%
+  summarise(itens = n()) %>%
+  group_by(classes) %>%
+  summarise(media_itens = mean(itens),
+            std_err = std.error(itens)) %>%
+  ggplot(aes(x = factor(classes), y = media_itens, fill = media_itens)) +
+  geom_bar(position = 'dodge', stat = 'identity', show.legend = FALSE) +
+  geom_text(aes(label=round(media_itens,0)), vjust=10, size = 4, color = 'white') +
+  geom_errorbar(aes(ymax = media_itens + std_err, ymin = media_itens - std_err), width = .1,
+                position = position_dodge(.9)) +
+  scale_fill_gradient(low='sky blue', high='blue') +
+  theme_classic() +
+  xlab('Classes') + ylab('Media de produtos por pedido') +
+  ggtitle('Media de produdos vendidos por classes')
+```
+
+### 7 - Market Basket Analysis com o algoritimo Apriori
+
+Gerando um dataset transacional com base nas vendas por produtos
+```{r}
+# criando um dataset com as transacoes
+df_trans <- dataset %>% filter(eval_set == 'prior') %>%
+  group_by(order_id) %>%
+  summarise(itens = as.vector(list(product_name))) 
+
+# transformando para o formato transacional
+df_trans <- as(df_trans$itens, 'transactions')
+
+# resumo do dataset de transacoes
+summary(df_trans)
+```
+
+Visualizando as primeiras linhas dos dados de transações
+
+```{r}
+# Visualizando as primeiras transacoes
+inspect(df_trans[1:3])
+```
+
+visualizando os itens com maior frequência de vendas
+
+```{r}
+# Plot com os 20 itens com a maior frequencia relativa
+itemFrequencyPlot(df_trans,topN=20,type="relative")
+```
+
+Criando as regras de associação utilizando o algorítimo apriori, foi considerado um suporte mínimo de 0,001 e confiança de 0,25 e foram criadas 373 regras.
+
+```{r}
+# criando as regras
+regras <- apriori(df_trans, parameter = list(sup = 0.001, conf = 0.25,  minlen= 2))
+```
+```{r}
+# Regras de associação
+inspect(regras[1:10])
+```
